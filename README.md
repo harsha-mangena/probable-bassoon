@@ -4,6 +4,22 @@ A scheduling agent a small business attaches to the calendar it already uses.
 The product is the booking write: atomic, idempotent, and honest — the agent
 never says "you're booked" before a booking id exists.
 
+## Run the product
+
+Zero dependencies, Python 3.11+ stdlib only:
+
+```bash
+python3 server.py          # serves at http://localhost:8080/
+```
+
+Open the page: five tabs — **Today** (call log), **Bookings** (move/cancel),
+**Text Call** (the interactive demo), **Setup** (business config), **Admin**
+(control plane: engine health, holds, reminders, operator actions).
+
+Every booking id the UI shows comes from the server. The Text Call tab runs
+the real flow — hold → commit → server-issued id — and its retry button
+replays the identical idempotency key to prove no duplicate is created.
+
 ## How it works
 
 One call, in order: greet → intent → service from config → live slots only →
@@ -23,20 +39,35 @@ The checks are not optional:
 
 | File | What it is |
 |---|---|
+| `server.py` | Stdlib HTTP server: JSON API + serves the UI |
+| `index.html` | The frontend: 5 tabs wired to the API, no mocks |
 | `engine.py` | Booking engine: SQLite, holds with TTL, idempotent commits, atomic moves |
-| `call_flow.py` | The text-call flow (chain of thought, bounded retry → handoff) |
+| `call_flow.py` | The scripted text-call flow (used by the CLI demos) |
 | `google_adapter.py` | The one real calendar: same 6 operations against Google Calendar |
 | `salon.toml` | Business config: services, hours, timezone, policy, reminders, escalation |
 | `tests.py` | 8 local tests proving the safety checks |
-| `demo_call.py` | Scripted haircut call + retry proof |
+| `demo_call.py` | Scripted haircut call + retry proof (CLI) |
+| `e2e_lifecycle.py` | Book → move → cancel → rebook dry run (CLI) |
 | `real_calendar_proof.py` | Hold → commit → retry → cancel against Google Calendar (cleans up) |
 | `DECISIONS.md` | The product decisions and why |
 
-## Run it
+## API
+
+- `POST /api/call/start` `{want}` → session + live slots
+- `POST /api/call/choose` `{session_id, pick}` → server-side hold
+- `POST /api/call/commit` `{session_id, name, phone}` → booking id
+- `POST /api/call/retry` `{session_id}` → same id, proves no duplicate
+- `GET /api/slots?service_id=&day=` · `GET /api/bookings`
+- `POST /api/bookings/move` · `POST /api/bookings/cancel`
+- `GET /api/calls` · `GET /api/config`
+- `GET /api/admin` · `POST /api/admin/expire_holds|sweep|reset`
+
+## CLI checks
 
 ```bash
-python3 tests.py        # 8 tests, local calendar, no keys needed
-python3 demo_call.py    # the haircut call + the retry that creates no second booking
+python3 tests.py           # 8 tests, local calendar, no keys needed
+python3 demo_call.py       # the haircut call + the retry that creates no second booking
+python3 e2e_lifecycle.py   # full lifecycle dry run
 ```
 
 The Google adapter needs Google Calendar connected; without it every
