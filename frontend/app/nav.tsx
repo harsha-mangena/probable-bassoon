@@ -7,6 +7,7 @@ const TABS = [
   { href: "/today", label: "Today" },
   { href: "/bookings", label: "Bookings" },
   { href: "/call", label: "Text Call" },
+  { href: "/voice", label: "Voice Call" },
   { href: "/setup", label: "Setup" },
   { href: "/admin", label: "Admin" },
 ];
