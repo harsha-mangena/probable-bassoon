@@ -1,0 +1,28 @@
+[clinic]
+name = "Northstar Clinic"
+timezone = "America/Los_Angeles"
+phone = "+14155550132"
+[policy]
+min_notice_minutes = 60
+max_advance_days = 90
+hold_minutes = 5
+cancellation_notice_minutes = 120
+max_occurrences = 12
+[[doctors]]
+id = "maya-patel"
+name = "Dr. Maya Patel"
+specialty = "Primary care"
+duration_minutes = 30
+buffer_minutes = 0
+[[doctors]]
+id = "james-chen"
+name = "Dr. James Chen"
+specialty = "Cardiology"
+duration_minutes = 45
+buffer_minutes = 15
+[[doctors]]
+id = "sofia-reyes"
+name = "Dr. Sofia Reyes"
+specialty = "Dermatology"
+duration_minutes = 30
+buffer_minutes = 0

@@ -1,286 +1,469 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Front Desk — Glow Studio</title>
-<style>
-  :root { --ink:#1c1a17; --muted:#6b655c; --line:#e8e2d8; --bg:#faf8f4; --card:#fff; --accent:#2f6fed; --good:#1d7a3a; --bad:#b3261e; }
-  * { box-sizing: border-box; }
-  body { font-family: -apple-system, "Segoe UI", Roboto, sans-serif; color: var(--ink); background: var(--bg); margin: 0; }
-  header { background: var(--ink); color: #fff; padding: 14px 20px; }
-  header h1 { margin: 0; font-size: 18px; }
-  header p { margin: 2px 0 0; font-size: 12px; color: #b9b2a6; }
-  nav { display: flex; gap: 4px; padding: 10px 20px 0; }
-  nav button { border: 1px solid var(--line); border-bottom: none; background: var(--bg); padding: 9px 16px; border-radius: 8px 8px 0 0; cursor: pointer; font-size: 14px; }
-  nav button.active { background: var(--card); font-weight: 600; }
-  main { padding: 16px 20px 40px; max-width: 960px; }
-  section.tab { display: none; background: var(--card); border: 1px solid var(--line); border-radius: 0 8px 8px 8px; padding: 18px; }
-  section.tab.active { display: block; }
-  table { width: 100%; border-collapse: collapse; font-size: 14px; margin-top: 8px; }
-  th, td { text-align: left; padding: 8px; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 600; }
-  .card { border: 1px solid var(--line); border-radius: 8px; padding: 12px 14px; margin: 10px 0; }
-  .row { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin: 8px 0; }
-  button.action { background: var(--accent); color: #fff; border: none; border-radius: 6px; padding: 8px 14px; cursor: pointer; font-size: 14px; }
-  button.action:disabled { opacity: .5; cursor: default; }
-  button.ghost { background: #fff; color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
-  button.danger { background: #fff; color: var(--bad); border: 1px solid var(--bad); border-radius: 6px; padding: 7px 12px; cursor: pointer; font-size: 13px; }
-  input, select { padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; font-size: 14px; }
-  .chat { display: flex; flex-direction: column; gap: 8px; margin: 12px 0; }
-  .msg { max-width: 80%; padding: 9px 13px; border-radius: 12px; font-size: 14px; line-height: 1.45; }
-  .msg.agent { background: #eef3ff; align-self: flex-start; }
-  .msg.caller { background: #e9e6df; align-self: flex-end; }
-  .slotbtn { margin: 3px; }
-  .ok { color: var(--good); font-weight: 600; }
-  .err { color: var(--bad); font-weight: 600; }
-  .muted { color: var(--muted); font-size: 13px; }
-  .kv { display: grid; grid-template-columns: 180px 1fr; gap: 4px 10px; font-size: 14px; }
-  h3 { margin: 18px 0 6px; }
-  .pill { display: inline-block; padding: 2px 9px; border-radius: 20px; font-size: 12px; background: #eef3ff; }
-  .pill.warn { background: #fff4e0; }
-</style>
-</head>
-<body>
-<header>
-  <h1>Front Desk</h1>
-  <p>Scheduling agent · Glow Studio · every booking id below came from the server</p>
-</header>
-<nav>
-  <button data-tab="today" class="active">Today</button>
-  <button data-tab="bookings">Bookings</button>
-  <button data-tab="call">Text Call</button>
-  <button data-tab="setup">Setup</button>
-  <button data-tab="admin">Admin</button>
-</nav>
-<main>
-  <section id="tab-today" class="tab active">
-    <h3>Today's calls</h3>
-    <div class="row"><button class="ghost" onclick="loadCalls()">Refresh</button></div>
-    <div id="calls"></div>
-  </section>
-
-  <section id="tab-bookings" class="tab">
-    <h3>Bookings</h3>
-    <div class="row"><button class="ghost" onclick="loadBookings()">Refresh</button></div>
-    <div id="bookings"></div>
-  </section>
-
-  <section id="tab-call" class="tab">
-    <h3>Text call <span class="muted">— drives the real engine, nothing is mocked</span></h3>
-    <div id="chat" class="chat"></div>
-    <div id="call-controls"></div>
-  </section>
-
-  <section id="tab-setup" class="tab">
-    <h3>Setup <span class="muted">— rules live in config; nobody edits prompts</span></h3>
-    <div id="config"></div>
-  </section>
-
-  <section id="tab-admin" class="tab">
-    <h3>Admin <span class="muted">— control plane</span></h3>
-    <div class="row">
-      <button class="ghost" onclick="loadAdmin()">Refresh</button>
-      <button class="ghost" onclick="adminAction('/api/admin/expire_holds')">Expire holds now</button>
-      <button class="ghost" onclick="adminAction('/api/admin/sweep')">Run reminder sweep</button>
-      <button class="danger" onclick="if(confirm('Reset demo state? Clears bookings, holds, calls.')) adminAction('/api/admin/reset')">Reset demo</button>
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Northstar · Clinic scheduling</title>
+    <link rel="stylesheet" href="/web/style.css" />
+    <script src="/web/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="brand" href="/" aria-label="Northstar home"
+        ><span class="brandmark">✚</span
+        ><span>northstar<span class="brand-sub">CLINIC & CARE</span></span></a
+      ><span class="header-note">Good care starts with a little clarity.</span
+      ><button id="staff-switch" class="quiet">Staff portal ↗</button>
+    </header>
+    <div id="notice" role="status" aria-live="polite" hidden></div>
+    <div id="patient-app">
+      <section class="hero">
+        <div>
+          <div class="eyebrow">YOUR NEXT STEP TO FEELING BETTER</div>
+          <h1>Care that fits<br />your calendar.</h1>
+          <p>
+            Find your doctor, choose a time, and leave the scheduling to us.
+          </p>
+        </div>
+        <div class="hero-card">
+          <span class="orb">✚</span>
+          <p>Real availability.<br /><strong>A little less waiting.</strong></p>
+          <span class="pill">● Live clinic calendar</span>
+        </div>
+      </section>
+      <nav class="tabs" aria-label="Patient navigation">
+        <button class="active" data-view="book">Book an appointment</button
+        ><button data-view="call">Call the front desk</button
+        ><button data-view="manage">Manage my appointments</button>
+      </nav>
+      <section id="view-book" class="view">
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">01 / FIND YOUR CARE</span>
+            <h2>Who would you like to see?</h2>
+          </div>
+          <span id="clinic-timezone" class="muted"></span>
+        </div>
+        <div id="doctor-cards" class="doctor-grid"></div>
+        <div class="booking-grid">
+          <section class="panel">
+            <h3>Choose your visit</h3>
+            <div class="fields">
+              <label>Date<input type="date" id="book-day" required /></label
+              ><label
+                >Appointments<select id="book-count">
+                  <option value="1">One appointment</option>
+                  <option value="2">2 appointments</option>
+                  <option value="4">4 appointments</option>
+                  <option value="8">8 appointments</option>
+                  <option value="12">12 appointments</option>
+                </select></label
+              ><label
+                >Repeat interval<select id="book-interval">
+                  <option value="1">Every week</option>
+                  <option value="2">Every 2 weeks</option>
+                  <option value="3">Every 3 weeks</option>
+                  <option value="4">Every 4 weeks</option>
+                </select></label
+              >
+            </div>
+            <p class="hint">
+              Recurring visits keep the same local time. All visits must be
+              available within the booking window.
+            </p>
+            <div class="slot-head">
+              <h4>Available times</h4>
+              <span id="slot-count" class="muted"></span>
+            </div>
+            <div id="slots" class="slot-grid">
+              <p class="muted">Choose a doctor to view times.</p>
+            </div>
+          </section>
+          <section class="panel review">
+            <div class="eyebrow">02 / MAKE IT YOURS</div>
+            <h3>Your appointment</h3>
+            <div id="selection-summary" class="summary">
+              Choose a doctor and a time to get started.
+            </div>
+            <form id="booking-form">
+              <label
+                >Patient’s full name<input
+                  id="patient-name"
+                  autocomplete="name"
+                  minlength="2"
+                  maxlength="100"
+                  required
+                  placeholder="Full name" /></label
+              ><label
+                >Phone number<input
+                  id="patient-phone"
+                  type="tel"
+                  autocomplete="tel"
+                  required
+                  placeholder="+1 415 555 0123"
+                  maxlength="25" /></label
+              ><button id="review-booking" class="primary full" type="submit">
+                Review appointment →
+              </button>
+            </form>
+            <div id="hold-review" hidden>
+              <div id="hold-summary"></div>
+              <p id="hold-expiry" class="hint"></p>
+              <button id="confirm-booking" class="primary full">
+                Confirm booking</button
+              ><button id="release-booking" class="quiet full">
+                Change my selection
+              </button>
+            </div>
+            <p class="hint">
+              Your visit is confirmed only after you receive a booking
+              reference.
+            </p>
+          </section>
+        </div>
+        <div id="booking-result" class="result" hidden></div>
+      </section>
+      <section id="view-call" class="view" hidden>
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">A FRIENDLIER FRONT DESK</span>
+            <h2>Let’s talk about your next visit.</h2>
+            <p class="muted">
+              Book, schedule weekly visits, cancel, or move an appointment.
+            </p>
+          </div>
+          <span class="pill">Free browser call</span>
+        </div>
+        <div class="call-grid">
+          <section class="panel">
+            <div class="call-top">
+              <span class="avatar">N</span>
+              <div>
+                <h3>Northstar front desk</h3>
+                <span id="call-status" class="muted">Ready when you are</span>
+              </div>
+              <button id="start-call" class="primary">Start call</button
+              ><button id="end-call" class="quiet" hidden>End</button>
+            </div>
+            <div
+              id="transcript"
+              class="transcript"
+              role="log"
+              aria-live="polite"
+            >
+              <div class="empty">
+                Your conversation will appear here.<br />Use your voice or type
+                a response.
+              </div>
+            </div>
+            <div id="call-choices" class="chips"></div>
+            <form id="call-form">
+              <input
+                id="call-text"
+                aria-label="Your response"
+                placeholder="Type your response…"
+                maxlength="500"
+                disabled
+              /><button id="call-send" class="primary" disabled>Send</button
+              ><button
+                id="mic"
+                type="button"
+                class="quiet"
+                disabled
+                aria-label="Speak a response"
+              >
+                🎙 Speak
+              </button>
+            </form>
+            <div id="call-result" hidden></div>
+          </section>
+          <aside class="panel call-aside">
+            <span class="eyebrow">HOW IT WORKS</span>
+            <h3>A simple conversation.</h3>
+            <ol>
+              <li>Choose your doctor and date.</li>
+              <li>Pick an open time and number of visits.</li>
+              <li>Share your name and contact number.</li>
+              <li>Confirm, then save your reference.</li>
+            </ol>
+            <label class="check"
+              ><input type="checkbox" id="voice-consent" /> Enable spoken
+              responses and microphone input</label
+            >
+            <p class="hint">
+              Speech recognition depends on your browser and may send audio to
+              its speech service. Avoid sharing medical details. Typed responses
+              work in all browsers.
+            </p>
+            <div class="divider"></div>
+            <h4>Calling from a phone?</h4>
+            <p id="phone-channel" class="hint"></p>
+            <h4>Need urgent help?</h4>
+            <p class="hint">
+              This service schedules visits. For emergencies, contact local
+              emergency services.
+            </p>
+          </aside>
+        </div>
+      </section>
+      <section id="view-manage" class="view" hidden>
+        <div class="section-head">
+          <div>
+            <span class="eyebrow">PLANS CHANGE. THAT’S OKAY.</span>
+            <h2>Your appointments, in one place.</h2>
+          </div>
+        </div>
+        <section class="panel">
+          <form id="lookup-form" class="fields lookup">
+            <label
+              >Booking reference<input
+                id="manage-reference"
+                inputmode="numeric"
+                pattern="[0-9]{10}"
+                required
+                placeholder="10 digit reference" /></label
+            ><label
+              >Private management code<input
+                id="manage-code"
+                type="password"
+                inputmode="numeric"
+                pattern="[0-9]{12}"
+                required
+                placeholder="12 digit code" /></label
+            ><button class="primary">Find appointments</button>
+          </form>
+          <p id="cancel-policy" class="hint"></p>
+        </section>
+        <div id="patient-appointments" class="appointment-list"></div>
+        <button id="cancel-series" class="danger" hidden>
+          Cancel all appointments in this series
+        </button>
+      </section>
     </div>
-    <div id="admin"></div>
-  </section>
-</main>
-
-<script>
-const $ = id => document.getElementById(id);
-const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-
-async function api(method, path, body) {
-  const r = await fetch(path, {
-    method,
-    headers: {"Content-Type": "application/json"},
-    body: body ? JSON.stringify(body) : undefined,
-  });
-  const data = await r.json().catch(() => ({}));
-  return {status: r.status, data};
-}
-
-/* ---------- tabs ---------- */
-document.querySelectorAll("nav button").forEach(b => b.addEventListener("click", () => {
-  document.querySelectorAll("nav button").forEach(x => x.classList.remove("active"));
-  document.querySelectorAll("section.tab").forEach(x => x.classList.remove("active"));
-  b.classList.add("active");
-  const t = $("tab-" + b.dataset.tab);
-  t.classList.add("active");
-  ({today: loadCalls, bookings: loadBookings, call: initCall, setup: loadConfig, admin: loadAdmin})[b.dataset.tab]();
-}));
-
-/* ---------- today ---------- */
-async function loadCalls() {
-  const {data} = await api("GET", "/api/calls");
-  const el = $("calls");
-  if (!data.calls || !data.calls.length) { el.innerHTML = '<p class="muted">No calls yet today. Make one in the Text Call tab.</p>'; return; }
-  el.innerHTML = data.calls.map((c, i) =>
-    `<div class="card"><div class="muted">${esc(c.at)} ${c.booking_id ? "· booking <b>" + esc(c.booking_id) + "</b>" : ""} ${c.handoff ? '· <span class="pill warn">handoff</span>' : ""}</div>` +
-    c.transcript.map(m => `<div class="msg ${m.speaker}"><b>${m.speaker === "agent" ? "Front Desk" : "Caller"}:</b> ${esc(m.text)}</div>`).join("") +
-    `</div>`).join("");
-}
-
-/* ---------- bookings ---------- */
-async function loadBookings() {
-  const {data} = await api("GET", "/api/bookings");
-  const el = $("bookings");
-  if (!data.bookings || !data.bookings.length) { el.innerHTML = '<p class="muted">No confirmed bookings.</p>'; return; }
-  el.innerHTML = `<table><tr><th>When</th><th>Service</th><th>Customer</th><th>Reference</th><th></th></tr>` +
-    data.bookings.map(b =>
-      `<tr><td>${esc(b.label)}</td><td>${esc(b.service)}</td><td>${esc(b.customer_name || "")}</td><td><b>${esc(b.id)}</b></td>` +
-      `<td><input type="datetime-local" id="mv-${b.id}"> <button class="ghost" onclick="moveBooking('${b.id}')">Move</button> ` +
-      `<button class="danger" onclick="cancelBooking('${b.id}')">Cancel</button></td></tr>`).join("") + `</table>`;
-}
-async function moveBooking(id) {
-  const v = $("mv-" + id).value;
-  if (!v) return alert("Pick a new date/time first.");
-  const {status, data} = await api("POST", "/api/bookings/move", {booking_id: id, new_start: v});
-  if (status !== 200) return alert("Move failed: " + (data.error || status));
-  loadBookings();
-}
-async function cancelBooking(id) {
-  if (!confirm("Cancel booking " + id + "?")) return;
-  await api("POST", "/api/bookings/cancel", {booking_id: id, reason: "cancelled in panel"});
-  loadBookings();
-}
-
-/* ---------- text call ---------- */
-let sessionId = null;
-function initCall() { if (!$("chat").children.length) startCallUI(); }
-function startCallUI() {
-  $("chat").innerHTML = "";
-  $("call-controls").innerHTML =
-    `<div class="row"><input id="want" placeholder='Try: "I want a haircut"' style="flex:1;min-width:220px">` +
-    `<button class="action" onclick="callStart()">Start call</button></div>`;
-  addMsg("agent", "Hi, thanks for calling Glow Studio. What can I book for you today?");
-}
-function addMsg(speaker, text) {
-  const d = document.createElement("div");
-  d.className = "msg " + speaker;
-  d.innerHTML = `<b>${speaker === "agent" ? "Front Desk" : "Caller"}:</b> ${esc(text)}`;
-  $("chat").appendChild(d);
-  d.scrollIntoView({block: "nearest"});
-}
-async function callStart() {
-  const want = $("want").value.trim() || "I want a haircut";
-  addMsg("caller", want);
-  $("call-controls").innerHTML = `<p class="muted">Checking live availability…</p>`;
-  const {data} = await api("POST", "/api/call/start", {want});
-  if (data.handoff) {
-    data.transcript.slice(-1).forEach(m => addMsg(m.speaker, m.text));
-    $("call-controls").innerHTML = `<p class="err">Handoff — transfer: ${esc(data.transfer_phone)}</p>` + newCallBtn();
-    return;
-  }
-  sessionId = data.session_id;
-  addMsg("agent", `Got it — ${data.service.toLowerCase()}. Here are the next open times:`);
-  $("call-controls").innerHTML = data.slots.map(s =>
-    `<button class="ghost slotbtn" onclick="callChoose(${s.index})">${esc(s.label)}</button>`).join("");
-}
-async function callChoose(pick) {
-  const {status, data} = await api("POST", "/api/call/choose", {session_id: sessionId, pick});
-  (data.transcript || []).slice(-2).forEach(m => addMsg(m.speaker, m.text));
-  if (data.handoff || status === 409) {
-    if (data.slots) {
-      $("call-controls").innerHTML = `<p class="err">That time just got taken — pick another:</p>` +
-        data.slots.map(s => `<button class="ghost slotbtn" onclick="callChoose(${s.index})">${esc(s.label)}</button>`).join("");
-    } else {
-      $("call-controls").innerHTML = `<p class="err">Handoff.</p>` + newCallBtn();
-    }
-    return;
-  }
-  if (data.conflict) return;
-  $("call-controls").innerHTML =
-    `<div class="row"><input id="cname" placeholder="Name">` +
-    `<input id="cphone" placeholder="Phone">` +
-    `<button class="action" onclick="callCommit()">Confirm booking</button></div>` +
-    `<p class="muted">Slot held server-side. Nothing is confirmed until you press confirm.</p>`;
-}
-async function callCommit() {
-  const name = $("cname").value.trim(), phone = $("cphone").value.trim();
-  if (!name) return alert("Name is required.");
-  addMsg("caller", `${name}${phone ? ". " + phone : ""}`);
-  $("call-controls").innerHTML = `<p class="muted">Committing…</p>`;
-  const {data} = await api("POST", "/api/call/commit",
-    {session_id: sessionId, name, phone});
-  if (data.handoff) {
-    data.transcript.slice(-1).forEach(m => addMsg(m.speaker, m.text));
-    $("call-controls").innerHTML = newCallBtn();
-    return;
-  }
-  data.transcript.slice(-1).forEach(m => addMsg(m.speaker, m.text));
-  $("call-controls").innerHTML =
-    `<div class="card"><span class="ok">Booked.</span> Reference <b>${esc(data.booking_id)}</b> — issued by the server.<br><br>` +
-    `<button class="action" onclick="callRetry()">Retry commit (same key)</button> ` +
-    `<span class="muted">Replays the identical idempotency key. A correct engine returns the same id and creates nothing.</span></div>` +
-    `<div id="retry-out"></div>` + newCallBtn();
-}
-async function callRetry() {
-  const {data} = await api("POST", "/api/call/retry", {session_id: sessionId});
-  $("retry-out").innerHTML =
-    `<div class="card">${data.same_id && data.no_duplicate
-      ? `<span class="ok">Retry returned the same id (${esc(data.booking_id)}) — no second booking created.</span>`
-      : `<span class="err">PROBLEM: duplicate detected.</span>`}<br>` +
-    `<span class="muted">bookings before: ${data.bookings_before}, after: ${data.bookings_after}, replayed: ${data.replayed}</span></div>`;
-}
-function newCallBtn() {
-  return `<div class="row"><button class="ghost" onclick="sessionId=null;startCallUI()">Start a new call</button></div>`;
-}
-
-/* ---------- setup ---------- */
-async function loadConfig() {
-  const {data} = await api("GET", "/api/config");
-  const el = $("config");
-  const hrs = Object.entries(data.hours_weekly).map(([d, h]) =>
-    `<div><b>${d}</b>: ${h.length ? h.map(x => x.join("–")).join(", ") : "closed"}</div>`).join("");
-  el.innerHTML =
-    `<div class="kv"><b>Business</b><span>${esc(data.business.name)}</span>` +
-    `<b>Timezone</b><span>${esc(data.business.timezone)}</span>` +
-    `<b>Transfer</b><span>${esc(data.business.transfer_phone)}</span>` +
-    `<b>Calendar</b><span>${esc(data.calendar.provider)} — ${esc(data.calendar.note)}</span></div>` +
-    `<h3>Services</h3><table><tr><th>Service</th><th>Duration</th><th>Buffer after</th></tr>` +
-    data.services.map(s => `<tr><td>${esc(s.name)}</td><td>${s.duration_min} min</td><td>${s.buffer_after_min || 0} min</td></tr>`).join("") + `</table>` +
-    `<h3>Hours</h3>${hrs}` +
-    `<h3>Policy</h3><div class="kv"><b>Min notice</b><span>${data.policy.min_notice_min} min</span>` +
-    `<b>Max advance</b><span>${data.policy.max_advance_days} days</span>` +
-    `<b>Slot grid</b><span>${data.policy.slot_increment_min} min</span>` +
-    `<b>Hold TTL</b><span>${data.policy.hold_ttl_min} min</span></div>` +
-    `<h3>Reminders</h3><div class="kv"><b>Channel</b><span>${esc(data.reminders.confirm)}</span>` +
-    `<b>Send before</b><span>${(data.reminders.remind_before_min || []).join(", ")} min</span></div>`;
-}
-
-/* ---------- admin ---------- */
-async function loadAdmin() {
-  const {data} = await api("GET", "/api/admin");
-  const el = $("admin");
-  const c = data.counts;
-  el.innerHTML =
-    `<div class="row">` +
-    `<div class="card"><b>Engine</b><br><span class="ok">${esc(data.engine)}</span></div>` +
-    `<div class="card"><b>Confirmed bookings</b><br>${c.bookings_confirmed}</div>` +
-    `<div class="card"><b>Active holds</b><br>${c.holds_active}</div>` +
-    `<div class="card"><b>Pending reminders</b><br>${c.reminders_pending}</div>` +
-    `<div class="card"><b>Calls today</b><br>${c.calls_today}</div></div>` +
-    `<p class="muted">Calendar provider: ${esc(data.calendar_provider)} · Timezone: ${esc(data.timezone)}</p>` +
-    `<h3>Holds</h3>` + (data.holds.length
-      ? `<table><tr><th>Hold</th><th>Slot</th><th>Expires in</th></tr>` +
-        data.holds.map(h => `<tr><td>${esc(h.id)}</td><td>${esc(h.slot_label)}</td><td>${h.expires_in_min} min</td></tr>`).join("") + `</table>`
-      : `<p class="muted">No active holds.</p>`) +
-    `<h3>Reminders</h3>` + (data.reminders.length
-      ? `<table><tr><th>Booking</th><th>Channel</th><th>Sent</th></tr>` +
-        data.reminders.map(r => `<tr><td>${esc(r.booking_id)}</td><td>${esc(r.channel)}</td><td>${r.sent ? "yes" : "no"}</td></tr>`).join("") + `</table>`
-      : `<p class="muted">No reminders queued.</p>`);
-}
-async function adminAction(path) {
-  const {data} = await api("POST", path, {});
-  loadAdmin(); loadBookings();
-  alert(JSON.stringify(data));
-}
-
-loadCalls();
-</script>
-</body>
+    <div id="staff-app" hidden>
+      <section class="staff-heading">
+        <span class="eyebrow">CLINIC CONTROL PLANE</span>
+        <h1>A clear view of your day.</h1>
+        <p class="muted">The right people, at the right time.</p>
+      </section>
+      <section id="staff-login" class="panel login-panel">
+        <h2>Staff sign-in</h2>
+        <p class="hint">
+          Use the account created by your clinic administrator.
+        </p>
+        <form id="login-form">
+          <label
+            >Username<input
+              id="login-username"
+              autocomplete="username"
+              required /></label
+          ><label
+            >Password<input
+              id="login-password"
+              type="password"
+              autocomplete="current-password"
+              required /></label
+          ><button class="primary full">Sign in</button>
+        </form>
+      </section>
+      <div id="staff-control" hidden>
+        <div class="staff-bar">
+          <span id="staff-identity"></span
+          ><button id="staff-book" class="primary">Book for a patient</button
+          ><button id="refresh-staff" class="quiet">Refresh</button
+          ><button id="logout" class="quiet">Sign out</button>
+        </div>
+        <div id="stats" class="stats"></div>
+        <nav class="tabs" aria-label="Staff navigation">
+          <button class="active" data-staff="appointments">Appointments</button
+          ><button data-staff="availability">Doctor availability</button
+          ><button data-staff="activity">Activity log</button
+          ><button data-staff="admin" id="admin-tab">Administration</button>
+        </nav>
+        <section id="staff-appointments">
+          <div class="panel">
+            <div class="fields">
+              <label>Filter date<input type="date" id="staff-day" /></label
+              ><label
+                >Doctor<select id="staff-doctor">
+                  <option value="">All doctors</option>
+                </select></label
+              ><label
+                >Status<select id="staff-status">
+                  <option value="">All bookings</option>
+                  <option value="confirmed">Confirmed</option>
+                  <option value="cancelled">Cancelled</option>
+                </select></label
+              ><button class="quiet" id="clear-filters">Clear filters</button>
+            </div>
+          </div>
+          <div id="staff-appointment-list" class="appointment-list"></div>
+        </section>
+        <section id="staff-availability" hidden>
+          <div class="panel">
+            <h3>Set a doctor’s availability</h3>
+            <form id="availability-form">
+              <div class="fields">
+                <label>Doctor<select id="availability-doctor"></select></label
+                ><label
+                  >Schedule type<select id="availability-type">
+                    <option value="weekly">Weekly hours</option>
+                    <option value="override">Date override / time off</option>
+                  </select></label
+                ><label id="weekday-field"
+                  >Weekday<select id="availability-weekday">
+                    <option value="0">Monday</option>
+                    <option value="1">Tuesday</option>
+                    <option value="2">Wednesday</option>
+                    <option value="3">Thursday</option>
+                    <option value="4">Friday</option>
+                    <option value="5">Saturday</option>
+                    <option value="6">Sunday</option>
+                  </select></label
+                ><label id="override-field" hidden
+                  >Date<input type="date" id="availability-day"
+                /></label>
+              </div>
+              <label
+                >Time windows<textarea
+                  id="availability-windows"
+                  rows="3"
+                  placeholder="09:00-12:00&#10;13:00-17:00"
+                ></textarea>
+              </label>
+              <p class="hint">
+                One HH:MM-HH:MM window per line. Leave blank to close the day.
+                Existing appointments and live holds are protected.
+              </p>
+              <button class="primary">Save availability</button
+              ><button class="quiet" id="remove-override" type="button" hidden>
+                Remove date override
+              </button>
+            </form>
+            <div id="schedule-view" class="schedule-view"></div>
+          </div>
+        </section>
+        <section id="staff-activity" hidden>
+          <div class="panel">
+            <h3>Recent activity</h3>
+            <div id="audit-list"></div>
+          </div>
+        </section>
+        <section id="staff-admin" hidden>
+          <div class="booking-grid">
+            <div class="panel">
+              <h3>Add or update a doctor</h3>
+              <form id="doctor-form">
+                <label
+                  >Doctor ID<input
+                    id="doctor-id"
+                    pattern="[a-z0-9-]{3,60}"
+                    required
+                    placeholder="alex-morgan" /></label
+                ><label
+                  >Name<input
+                    id="doctor-name"
+                    required
+                    maxlength="100"
+                    placeholder="Dr. Alex Morgan" /></label
+                ><label
+                  >Specialty<input
+                    id="doctor-specialty"
+                    required
+                    maxlength="100"
+                /></label>
+                <div class="fields">
+                  <label
+                    >Visit minutes<input
+                      id="doctor-duration"
+                      type="number"
+                      min="5"
+                      max="180"
+                      value="30"
+                      required /></label
+                  ><label
+                    >Buffer minutes<input
+                      id="doctor-buffer"
+                      type="number"
+                      min="0"
+                      max="60"
+                      value="0"
+                      required /></label
+                  ><label
+                    >Status<select id="doctor-active">
+                      <option value="true">Active</option>
+                      <option value="false">Inactive</option>
+                    </select></label
+                  >
+                </div>
+                <button class="primary">Save doctor</button>
+              </form>
+              <div id="doctor-admin-list"></div>
+            </div>
+            <div class="panel">
+              <h3>Create a staff account</h3>
+              <form id="user-form">
+                <label
+                  >Username<input
+                    id="user-username"
+                    pattern="[a-zA-Z0-9_.-]{3,60}"
+                    required
+                    autocomplete="off" /></label
+                ><label
+                  >Password<input
+                    id="user-password"
+                    type="password"
+                    minlength="12"
+                    maxlength="256"
+                    required
+                    autocomplete="new-password" /></label
+                ><label
+                  >Role<select id="user-role">
+                    <option value="manager">Manager · scheduling</option>
+                    <option value="admin">Admin · scheduling & staff</option>
+                  </select></label
+                ><button class="primary">Create account</button>
+              </form>
+              <div id="user-list"></div>
+            </div>
+          </div>
+        </section>
+      </div>
+    </div>
+    <footer>
+      <span>✚ <strong id="footer-name">Northstar Clinic</strong></span
+      ><span>Appointments made simple. Care stays human.</span>
+    </footer>
+    <dialog id="move-dialog">
+      <form id="move-form">
+        <div class="section-head">
+          <h3>Move appointment</h3>
+          <button
+            type="button"
+            id="close-move"
+            class="quiet"
+            aria-label="Close"
+          >
+            ✕
+          </button>
+        </div>
+        <p id="move-current" class="muted"></p>
+        <label>New date<input type="date" id="move-day" required /></label
+        ><label>Available time<select id="move-slot" required></select></label>
+        <p class="hint">
+          Only this occurrence moves. Other visits in the series stay at their
+          original times.
+        </p>
+        <button class="primary full">Confirm new time</button>
+      </form>
+    </dialog>
+    <dialog id="confirm-dialog">
+      <h3 id="confirm-title">Confirm action</h3>
+      <p id="confirm-message"></p>
+      <div class="dialog-actions">
+        <button class="quiet" id="confirm-no">Keep appointment</button
+        ><button class="danger" id="confirm-yes">Confirm cancellation</button>
+      </div>
+    </dialog>
+  </body>
 </html>

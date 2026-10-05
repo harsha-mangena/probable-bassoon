@@ -1,0 +1,13 @@
+{
+  "name": "northstar-clinic-scheduler",
+  "version": "2.0.0",
+  "private": true,
+  "scripts": {
+    "test": "python -m unittest discover -s tests -v",
+    "test:browser": "node tests/browser.cjs",
+    "check": "node --check web/app.js"
+  },
+  "devDependencies": {
+    "playwright": "1.62.1"
+  }
+}

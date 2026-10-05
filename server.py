@@ -1,490 +1,450 @@
 #!/usr/bin/env python3
-"""Front Desk server — stdlib only, no dependencies.
-
-Serves the web UI and a JSON API over the real booking engine.
-Every booking id the UI shows comes from the engine; retries replay the
-same idempotency key against the engine, so the "no duplicate" proof is
-real, not a mock.
-
-Run:
-    python3 server.py [port]        # default 8080
-Then open http://localhost:8080/ in a browser.
-"""
-
+"""Clinic HTTP boundary. Persistent data; protected control plane; same-origin UI."""
+import argparse
+import hmac
 import json
+import logging
+import os
 import threading
+import time
 import tomllib
-import uuid
-from datetime import datetime, timedelta, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.parse import urlparse, parse_qs
-from zoneinfo import ZoneInfo
+from collections import defaultdict, deque
+from http.cookies import SimpleCookie
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+from auth import Auth
+from call_flow import Calls
+from engine import Engine, Problem, iso
+from telephony import handle, valid_signature
 
-from engine import (
-    BookingError,
-    BookingNotFoundError,
-    Engine,
-    HoldExpiredError,
-    HoldNotFoundError,
-    SlotConflictError,
-    _utcnow,
-)
-
-CONFIG_PATH = "salon.toml"
-DB_PATH = "frontdesk.db"
+ROOT = Path(__file__).resolve().parent
 
 
-def load_config() -> dict:
-    with open(CONFIG_PATH, "rb") as f:
-        return tomllib.load(f)
+class RateLimit:
+    def __init__(self):
+        self.values = defaultdict(deque)
+        self.lock = threading.Lock()
+
+    def check(self, key, limit=60):
+        now = time.monotonic()
+        with self.lock:
+            if len(self.values) > 10000:
+                for k in list(self.values):
+                    if not self.values[k] or self.values[k][-1] < now - 60:
+                        del self.values[k]
+            q = self.values[key]
+            while q and q[0] < now - 60:
+                q.popleft()
+            if len(q) >= limit:
+                raise Problem(
+                    "Too many requests. Try again in one minute.", 429, "rate_limited"
+                )
+            q.append(now)
 
 
-CONFIG = load_config()
-TZ = ZoneInfo(CONFIG["business"]["timezone"])
-ENGINE = Engine(CONFIG, db_path=DB_PATH)
-
-SESSIONS: dict[str, dict] = {}
-CALL_LOG: list[dict] = []
-LOCK = threading.Lock()
-
-
-# --------------------------------------------------------------------------
-# helpers
-
-
-def iso_local(dt: datetime) -> str:
-    return dt.astimezone(TZ).isoformat()
-
-
-def slot_label(start: datetime) -> str:
-    return start.astimezone(TZ).strftime("%a %b %d, %-I:%M %p")
-
-
-def booking_view(row: dict) -> dict:
-    start = datetime.fromisoformat(row["start_utc"]).astimezone(TZ)
-    end = datetime.fromisoformat(row["end_utc"]).astimezone(TZ)
-    svc = next((s for s in CONFIG["services"] if s["id"] == row["service_id"]),
-               {"name": row["service_id"]})
-    return {
-        "id": row["id"],
-        "service": svc["name"],
-        "start": iso_local(start),
-        "end": iso_local(end),
-        "label": f"{slot_label(start)} – {end.astimezone(TZ).strftime('%-I:%M %p')}",
-        "customer_name": row.get("customer_name"),
-        "customer_phone": row.get("customer_phone"),
-        "status": row["status"],
-    }
-
-
-def match_service(want: str) -> dict | None:
-    matches = [s for s in CONFIG["services"]
-               if s["id"] in want.lower() or s["name"].lower() in want.lower()]
-    return matches[0] if len(matches) == 1 else None
-
-
-def find_slots(service_id: str, now: datetime):
-    """First day (from today) with live slots, up to max_advance_days."""
-    day = now.astimezone(TZ).date()
-    for _ in range(CONFIG["policy"]["max_advance_days"]):
-        slots = ENGINE.list_free_slots(service_id, day, now=now)
-        if slots:
-            return slots
-        day += timedelta(days=1)
-    return []
-
-
-def log_call(transcript, booking_id=None, handoff=False):
-    CALL_LOG.append({
-        "at": _utcnow().isoformat(),
-        "booking_id": booking_id,
-        "handoff": handoff,
-        "transcript": transcript,
-    })
-
-
-def handoff_message(reason: str) -> str:
-    phone = CONFIG["business"]["transfer_phone"]
-    return ("I'm having trouble with the booking system on my end, so I don't "
-            f"want to guess. Let me connect you with the shop at {phone} — "
-            "I've saved everything you've told me so far.")
-
-
-# --------------------------------------------------------------------------
-# API
-
-
-def api_call_start(body: dict) -> tuple[int, dict]:
-    now = _utcnow()
-    want = (body.get("want") or "").strip()
-    transcript = [
-        {"speaker": "agent",
-         "text": f"Hi, thanks for calling {CONFIG['business']['name']}. "
-                 "What can I book for you today?"},
-        {"speaker": "caller", "text": want},
-    ]
-    svc = match_service(want)
-    if svc is None:
-        msg = handoff_message("ambiguous")
-        transcript.append({"speaker": "agent", "text": msg})
-        log_call(transcript, handoff=True)
-        return 200, {"handoff": True, "transcript": transcript,
-                     "transfer_phone": CONFIG["business"]["transfer_phone"]}
-    slots = find_slots(svc["id"], now)
-    if not slots:
-        msg = handoff_message("no_availability")
-        transcript.append({"speaker": "agent", "text": msg})
-        log_call(transcript, handoff=True)
-        return 200, {"handoff": True, "transcript": transcript,
-                     "transfer_phone": CONFIG["business"]["transfer_phone"]}
-    sid = uuid.uuid4().hex[:12]
-    shown = slots[:6]
-    transcript.append(
-        {"speaker": "agent",
-         "text": f"Got it — {svc['name'].lower()}. Here are the next open times:"})
-    with LOCK:
-        SESSIONS[sid] = {
-            "stage": "slots", "service_id": svc["id"],
-            "slots": [(iso_local(s), iso_local(e)) for s, e in shown],
-            "transcript": transcript, "created": now,
-        }
-    return 200, {
-        "session_id": sid,
-        "service": svc["name"],
-        "slots": [{"index": i, "start": iso_local(s), "end": iso_local(e),
-                   "label": slot_label(s)} for i, (s, e) in enumerate(shown)],
-        "transcript": transcript,
-    }
-
-
-def api_call_choose(body: dict) -> tuple[int, dict]:
-    now = _utcnow()
-    sid = body.get("session_id")
-    pick = body.get("pick", 0)
-    with LOCK:
-        sess = SESSIONS.get(sid)
-    if not sess or sess["stage"] != "slots":
-        return 400, {"error": "unknown or expired session; start a new call"}
-    try:
-        start_local = datetime.fromisoformat(sess["slots"][pick][0])
-    except (IndexError, ValueError):
-        return 400, {"error": "invalid slot choice"}
-    sess["transcript"].append(
-        {"speaker": "caller",
-         "text": datetime.fromisoformat(sess["slots"][pick][0])
-                 .strftime("%A at %-I:%M %p")})
-    try:
-        hold_id = ENGINE.hold_slot(
-            sess["service_id"], start_local,
-            client_hold_id=f"sess-{sid}", now=now)
-    except SlotConflictError:
-        msg = ("That time just got taken — let me check what's open now instead.")
-        sess["transcript"].append({"speaker": "agent", "text": msg})
-        slots = find_slots(sess["service_id"], now)
-        with LOCK:
-            sess["stage"] = "slots"
-            sess["slots"] = [(iso_local(s), iso_local(e)) for s, e in slots[:6]]
-        log_call(sess["transcript"], handoff=True)
-        return 409, {"conflict": True,
-                     "slots": [{"index": i, "start": iso_local(s),
-                                "end": iso_local(e), "label": slot_label(s)}
-                               for i, (s, e) in enumerate(slots[:6])],
-                     "transcript": sess["transcript"]}
-    except BookingError as exc:
-        msg = handoff_message("hold_failed")
-        sess["transcript"].append({"speaker": "agent", "text": msg})
-        log_call(sess["transcript"], handoff=True)
-        return 200, {"handoff": True, "transcript": sess["transcript"],
-                     "error": str(exc)}
-    with LOCK:
-        sess["stage"] = "held"
-        sess["hold_id"] = hold_id
-        sess["slot_label"] = slot_label(start_local)
-    sess["transcript"].append(
-        {"speaker": "agent",
-         "text": "I've held that slot for you. What's your name and phone number?"})
-    return 200, {"session_id": sid, "hold_id": hold_id,
-                 "slot": sess["slot_label"], "transcript": sess["transcript"]}
-
-
-def api_call_commit(body: dict) -> tuple[int, dict]:
-    now = _utcnow()
-    sid = body.get("session_id")
-    name = (body.get("name") or "").strip()
-    phone = (body.get("phone") or "").strip()
-    with LOCK:
-        sess = SESSIONS.get(sid)
-    if not sess or sess["stage"] != "held" or not name:
-        return 400, {"error": "session not ready to commit (need slot + name)"}
-    idem_key = f"sess-{sid}-commit"
-    try:
-        booking_id, replayed = ENGINE.commit_booking(
-            sess["hold_id"], name, phone, idem_key, now=now)
-    except (HoldExpiredError, HoldNotFoundError, SlotConflictError,
-            BookingError) as exc:
-        msg = handoff_message("commit_failed")
-        sess["transcript"].append({"speaker": "agent", "text": msg})
-        log_call(sess["transcript"], handoff=True)
-        return 200, {"handoff": True, "transcript": sess["transcript"],
-                     "error": str(exc)}
-    # Confirmation language ONLY after the booking id exists.
-    svc = next(s for s in CONFIG["services"] if s["id"] == sess["service_id"])
-    sess["transcript"].append(
-        {"speaker": "agent",
-         "text": f"You're booked, {name} — {svc['name'].lower()} "
-                 f"{sess['slot_label']}. Your booking reference is {booking_id}."})
-    with LOCK:
-        sess["stage"] = "committed"
-        sess["booking_id"] = booking_id
-        sess["idem_key"] = idem_key
-    log_call(sess["transcript"], booking_id=booking_id)
-    return 200, {"session_id": sid, "booking_id": booking_id,
-                 "replayed": replayed, "transcript": sess["transcript"]}
-
-
-def api_call_retry(body: dict) -> tuple[int, dict]:
-    """Replay the commit with the SAME idempotency key. Must return the
-    same booking id and must not create a second booking."""
-    now = _utcnow()
-    sid = body.get("session_id")
-    with LOCK:
-        sess = SESSIONS.get(sid)
-    if not sess or sess["stage"] != "committed":
-        return 400, {"error": "nothing to retry yet — complete a booking first"}
-    before = ENGINE.count_bookings()
-    booking_id, replayed = ENGINE.commit_booking(
-        sess["hold_id"], "", "", sess["idem_key"], now=now)
-    after = ENGINE.count_bookings()
-    return 200, {
-        "booking_id": booking_id,
-        "replayed": replayed,
-        "same_id": booking_id == sess["booking_id"],
-        "bookings_before": before,
-        "bookings_after": after,
-        "no_duplicate": before == after,
-    }
-
-
-def api_slots(query: dict) -> tuple[int, dict]:
-    service_id = query.get("service_id", ["haircut"])[0]
-    day = query.get("day", [None])[0]
-    now = _utcnow()
-    if not day:
-        day = now.astimezone(TZ).date().isoformat()
-    try:
-        slots = ENGINE.list_free_slots(service_id, day, now=now)
-    except BookingError as exc:
-        return 400, {"error": str(exc)}
-    return 200, {"day": day, "slots": [
-        {"start": iso_local(s), "end": iso_local(e), "label": slot_label(s)}
-        for s, e in slots[:24]]}
-
-
-def api_bookings() -> tuple[int, dict]:
-    rows = ENGINE.db.execute(
-        "SELECT * FROM bookings WHERE status='confirmed' ORDER BY start_utc"
-    ).fetchall()
-    return 200, {"bookings": [booking_view(dict(r)) for r in rows]}
-
-
-def api_booking_move(body: dict) -> tuple[int, dict]:
-    try:
-        new_start = datetime.fromisoformat(body["new_start"])
-    except (KeyError, ValueError):
-        return 400, {"error": "new_start must be an ISO datetime"}
-    try:
-        bid = ENGINE.move_booking(body["booking_id"], new_start)
-    except (BookingNotFoundError, SlotConflictError) as exc:
-        return 409, {"error": str(exc)}
-    return 200, {"booking_id": bid, "booking": booking_view(ENGINE.get_booking(bid))}
-
-
-def api_booking_cancel(body: dict) -> tuple[int, dict]:
-    try:
-        ENGINE.cancel_booking(body["booking_id"], body.get("reason", ""))
-    except BookingNotFoundError as exc:
-        return 404, {"error": str(exc)}
-    return 200, {"cancelled": body["booking_id"]}
-
-
-def api_calls() -> tuple[int, dict]:
-    return 200, {"calls": list(reversed(CALL_LOG))}
-
-
-def api_config() -> tuple[int, dict]:
-    return 200, {
-        "business": CONFIG["business"],
-        "calendar": {"provider": CONFIG["calendar"].get("provider", "local"),
-                     "note": "server-side store (SQLite); Google adapter binds later"},
-        "services": CONFIG["services"],
-        "hours_weekly": CONFIG["hours"]["weekly"],
-        "hours_overrides": CONFIG["hours"].get("overrides", {}),
-        "policy": CONFIG["policy"],
-        "reminders": CONFIG["reminders"],
-        "escalation": CONFIG["escalation"],
-    }
-
-
-def api_admin() -> tuple[int, dict]:
-    now = _utcnow()
-    holds = [dict(r) for r in ENGINE.db.execute(
-        "SELECT * FROM bookings WHERE status='held' ORDER BY hold_expires_utc"
-    ).fetchall()]
-    for h in holds:
-        exp = datetime.fromisoformat(h["hold_expires_utc"]) if h.get("hold_expires_utc") else None
-        h["expires_in_min"] = max(0, int((exp - now).total_seconds() // 60)) if exp else None
-        h["slot_label"] = slot_label(datetime.fromisoformat(h["start_utc"]))
-    reminders = [dict(r) for r in ENGINE.db.execute(
-        """SELECT r.*, b.status AS booking_status FROM reminders r
-           JOIN bookings b ON b.id = r.booking_id ORDER BY r.remind_at_utc"""
-    ).fetchall()]
-    return 200, {
-        "engine": "ok",
-        "business": CONFIG["business"]["name"],
-        "timezone": str(TZ),
-        "calendar_provider": "local (SQLite store)",
-        "counts": {
-            "bookings_confirmed": ENGINE.count_bookings("confirmed"),
-            "holds_active": len(holds),
-            "reminders_pending": sum(1 for r in reminders if not r["sent"]),
-            "calls_today": len(CALL_LOG),
-        },
-        "holds": holds,
-        "reminders": reminders,
-    }
-
-
-def api_admin_expire_holds() -> tuple[int, dict]:
-    return 200, {"expired": ENGINE.expire_holds()}
-
-
-def api_admin_sweep() -> tuple[int, dict]:
-    due = ENGINE.reminders_due()
-    for r in due:
-        ENGINE.mark_reminder_sent(r["id"])
-    return 200, {"sent": len(due),
-                 "reminders": [{"booking_id": r["booking_id"],
-                                "channel": r["channel"]} for r in due]}
-
-
-def api_admin_reset() -> tuple[int, dict]:
-    with LOCK:
-        SESSIONS.clear()
-        CALL_LOG.clear()
-    ENGINE.db.execute("DELETE FROM reminders")
-    ENGINE.db.execute("DELETE FROM bookings")
-    ENGINE.db.commit()
-    return 200, {"reset": True}
-
-
-# --------------------------------------------------------------------------
-# HTTP
+class App:
+    def __init__(self, engine, origin=None, twilio_token=None):
+        self.engine = engine
+        self.auth = Auth(engine)
+        self.calls = Calls(engine)
+        self.rate = RateLimit()
+        self.origin = origin.rstrip("/") if origin else None
+        self.twilio_token = twilio_token
+        self.secure = bool(self.origin and self.origin.startswith("https://"))
 
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "FrontDesk/1.0"
+    server_version = "Northstar/2"
 
-    def log_message(self, fmt, *args):  # quieter logs
+    def log_message(self, *args):
         pass
 
-    def _send(self, status: int, payload: dict):
-        body = json.dumps(payload).encode()
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+    @property
+    def app(self):
+        return self.server.app
 
-    def _read_body(self) -> dict:
-        length = int(self.headers.get("Content-Length", 0) or 0)
-        if not length:
-            return {}
+    def cookie(self):
+        c = SimpleCookie()
         try:
-            return json.loads(self.rfile.read(length) or b"{}")
-        except json.JSONDecodeError:
-            return {}
+            c.load(self.headers.get("Cookie", ""))
+        except Exception:
+            return ""
+        return c["clinic_session"].value if "clinic_session" in c else ""
+
+    def staff(self, admin=False, write=False):
+        u = self.app.auth.session(self.cookie())
+        if admin and u["role"] != "admin":
+            raise Problem("Administrator role required", 403, "forbidden")
+        if write and not hmac.compare_digest(
+            u["csrf"], self.headers.get("X-CSRF-Token", "")
+        ):
+            raise Problem("Invalid CSRF token", 403, "forbidden")
+        return u
+
+    def send(
+        self, status, payload, ctype="application/json; charset=utf-8", cookie=None
+    ):
+        raw = (
+            json.dumps(payload).encode()
+            if ctype.startswith("application/json")
+            else payload
+        )
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(raw)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header(
+            "Content-Security-Policy",
+            "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
+        )
+        self.send_header("Permissions-Policy", "microphone=(self), camera=()")
+        if self.app.secure:
+            self.send_header("Strict-Transport-Security", "max-age=31536000")
+        if status == 429:
+            self.send_header("Retry-After", "60")
+        if cookie is not None:
+            self.send_header(
+                "Set-Cookie",
+                "clinic_session="
+                + cookie
+                + "; Path=/; HttpOnly; SameSite=Strict; Max-Age="
+                + ("28800" if cookie else "0")
+                + ("; Secure" if self.app.secure else ""),
+            )
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def read(self, form=False):
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except ValueError:
+            raise Problem("Invalid content length")
+        if not 0 < length <= 32768:
+            raise Problem("Request body must be 1–32768 bytes", 413)
+        expected = "application/x-www-form-urlencoded" if form else "application/json"
+        if self.headers.get("Content-Type", "").split(";")[0] != expected:
+            raise Problem("Unsupported content type", 415)
+        try:
+            raw = self.rfile.read(length).decode()
+            body = (
+                parse_qs(raw, keep_blank_values=True, max_num_fields=100)
+                if form
+                else json.loads(raw)
+            )
+        except (ValueError, UnicodeError):
+            raise Problem("Invalid request body")
+        if not isinstance(body, dict):
+            raise Problem("Request body must be an object")
+        return body
 
     def do_GET(self):
-        parsed = urlparse(self.path)
-        path, query = parsed.path, parse_qs(parsed.query)
-        try:
-            if path == "/api/slots":
-                self._send(*api_slots(query))
-            elif path == "/api/bookings":
-                self._send(*api_bookings())
-            elif path == "/api/calls":
-                self._send(*api_calls())
-            elif path == "/api/config":
-                self._send(*api_config())
-            elif path == "/api/admin":
-                self._send(*api_admin())
-            elif path == "/" or path == "/index.html":
-                self._serve_file("index.html", "text/html")
-            else:
-                self._send(404, {"error": "not found"})
-        except BrokenPipeError:
-            pass
-        except Exception as exc:  # never crash the demo on a bad request
-            self._send(500, {"error": f"server error: {exc}"})
+        self.dispatch(False)
 
     def do_POST(self):
-        parsed = urlparse(self.path)
-        path = parsed.path
-        body = self._read_body()
-        try:
-            if path == "/api/call/start":
-                self._send(*api_call_start(body))
-            elif path == "/api/call/choose":
-                self._send(*api_call_choose(body))
-            elif path == "/api/call/commit":
-                self._send(*api_call_commit(body))
-            elif path == "/api/call/retry":
-                self._send(*api_call_retry(body))
-            elif path == "/api/bookings/move":
-                self._send(*api_booking_move(body))
-            elif path == "/api/bookings/cancel":
-                self._send(*api_booking_cancel(body))
-            elif path == "/api/admin/expire_holds":
-                self._send(*api_admin_expire_holds())
-            elif path == "/api/admin/sweep":
-                self._send(*api_admin_sweep())
-            elif path == "/api/admin/reset":
-                self._send(*api_admin_reset())
-            else:
-                self._send(404, {"error": "not found"})
-        except BrokenPipeError:
-            pass
-        except Exception as exc:
-            self._send(500, {"error": f"server error: {exc}"})
+        self.dispatch(True)
 
-    def _serve_file(self, rel: str, content_type: str | None):
-        import os
-        full = os.path.join(os.path.dirname(os.path.abspath(__file__)), rel)
-        if not os.path.isfile(full) or ".." in rel:
-            self._send(404, {"error": "not found"})
-            return
-        ctype = content_type or {
-            ".html": "text/html", ".js": "application/javascript",
-            ".css": "text/css", ".json": "application/json",
-        }.get(os.path.splitext(full)[1], "application/octet-stream")
-        with open(full, "rb") as f:
-            data = f.read()
-        self.send_response(200)
-        self.send_header("Content-Type", ctype)
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+    def dispatch(self, post):
+        try:
+            path = urlparse(self.path).path
+            q = parse_qs(urlparse(self.path).query)
+            one = lambda k: q.get(k, [None])[0]
+            e = self.app.engine
+            if path == "/api/voice/twilio" and post:
+                if (
+                    not self.app.twilio_token
+                    or not self.app.origin
+                    or not self.app.secure
+                ):
+                    raise Problem("Phone channel is not configured", 503)
+                params = self.read(True)
+                url = self.app.origin + self.path
+                if not valid_signature(
+                    self.app.twilio_token,
+                    url,
+                    params,
+                    self.headers.get("X-Twilio-Signature"),
+                ):
+                    raise Problem("Invalid phone webhook signature", 403)
+                raw = handle(self.app.calls, params, one("step"))
+                return self.send(200, raw, "application/xml; charset=utf-8")
+            self.app.rate.check((self.client_address[0], "general"), 600)
+            if post:
+                expected = self.app.origin or "http://" + self.headers.get("Host", "")
+                origin = self.headers.get("Origin")
+                if origin and origin != expected:
+                    raise Problem("Cross-origin request rejected", 403)
+                if self.headers.get("Sec-Fetch-Site") == "cross-site":
+                    raise Problem("Cross-site request rejected", 403)
+                body = self.read()
+            else:
+                body = {}
+            if path.startswith("/api/admin") or path == "/api/auth/logout":
+                user = self.staff(
+                    admin=path in ("/api/admin/users", "/api/admin/doctors"), write=post
+                )
+            if not post:
+                if path in ("/", "/index.html"):
+                    return self.send(
+                        200,
+                        (ROOT / "index.html").read_bytes(),
+                        "text/html; charset=utf-8",
+                    )
+                if path in ("/web/app.js", "/web/style.css"):
+                    return self.send(
+                        200,
+                        (ROOT / path.lstrip("/")).read_bytes(),
+                        (
+                            "application/javascript; charset=utf-8"
+                            if path.endswith(".js")
+                            else "text/css; charset=utf-8"
+                        ),
+                    )
+                if path == "/api/health":
+                    with e.db() as db:
+                        db.execute("SELECT 1").fetchone()
+                    return self.send(200, {"ok": True, "service": "clinic-scheduler"})
+                if path == "/api/config":
+                    return self.send(
+                        200,
+                        {
+                            "clinic": e.config["clinic"],
+                            "policy": e.policy,
+                            "today": e.clock().astimezone(e.tz).date().isoformat(),
+                            "voice": {
+                                "browser": "Web Speech API",
+                                "phone_enabled": bool(
+                                    self.app.twilio_token and self.app.secure
+                                ),
+                            },
+                        },
+                    )
+                if path == "/api/doctors":
+                    return self.send(200, {"doctors": e.doctors()})
+                if path == "/api/slots":
+                    return self.send(
+                        200, {"slots": e.slots(one("doctor_id"), one("day"))}
+                    )
+                if path == "/api/auth/me":
+                    return self.send(200, self.staff())
+                if path == "/api/admin/overview":
+                    return self.send(
+                        200, e.overview(one("day"), one("status"), one("doctor_id"))
+                    )
+                if path == "/api/admin/availability":
+                    return self.send(200, e.schedule(one("doctor_id")))
+                if path == "/api/admin/users":
+                    with e.db() as db:
+                        return self.send(
+                            200,
+                            {
+                                "users": [
+                                    dict(x)
+                                    for x in db.execute(
+                                        "SELECT username,role,active FROM users"
+                                    )
+                                ]
+                            },
+                        )
+            else:
+                if path == "/api/auth/login":
+                    self.app.rate.check((self.client_address[0], "login"), 10)
+                    token, result = self.app.auth.login(
+                        body.get("username"), body.get("password")
+                    )
+                    return self.send(200, result, cookie=token)
+                if path == "/api/auth/logout":
+                    self.app.auth.logout(self.cookie())
+                    return self.send(200, {"ok": True}, cookie="")
+                if path.startswith("/api/patient/"):
+                    self.app.rate.check((self.client_address[0], "patient"), 20)
+                if path in ("/api/holds", "/api/admin/holds"):
+                    self.app.rate.check((self.client_address[0], "holds"), 30)
+                    return self.send(
+                        201,
+                        e.hold(
+                            body.get("doctor_id"),
+                            body.get("start"),
+                            body.get("idempotency_key"),
+                            body.get("count", 1),
+                            body.get("interval_weeks", 1),
+                            actor=(
+                                user["username"]
+                                if path.startswith("/api/admin")
+                                else "patient"
+                            ),
+                        ),
+                    )
+                if path == "/api/holds/release":
+                    return self.send(
+                        200, e.release(body.get("hold_id"), body.get("idempotency_key"))
+                    )
+                if path in ("/api/bookings", "/api/admin/bookings"):
+                    self.app.rate.check((self.client_address[0], "commits"), 30)
+                    return self.send(
+                        201,
+                        e.commit(
+                            body.get("hold_id"),
+                            body.get("name"),
+                            body.get("phone"),
+                            body.get("idempotency_key"),
+                            actor=(
+                                user["username"]
+                                if path.startswith("/api/admin")
+                                else "patient"
+                            ),
+                        ),
+                    )
+                if path == "/api/patient/bookings":
+                    return self.send(
+                        200,
+                        e.patient_bookings(
+                            body.get("reference"), body.get("manage_code")
+                        ),
+                    )
+                if path == "/api/patient/cancel":
+                    return self.send(
+                        200,
+                        e.cancel(
+                            body.get("reference"),
+                            body.get("manage_code"),
+                            body.get("appointment_id"),
+                            body.get("reason", ""),
+                        ),
+                    )
+                if path == "/api/patient/move":
+                    return self.send(
+                        200,
+                        e.move(
+                            body.get("appointment_id"),
+                            body.get("start"),
+                            body.get("manage_code"),
+                        ),
+                    )
+                if path == "/api/call/start":
+                    self.app.rate.check((self.client_address[0], "calls"), 30)
+                    return self.send(201, self.app.calls.start())
+                if path == "/api/call/turn":
+                    self.app.rate.check((self.client_address[0], "turns"), 60)
+                    return self.send(
+                        200,
+                        self.app.calls.turn(
+                            body.get("call_id"),
+                            body.get("text"),
+                            body.get("request_id"),
+                            body.get("seq"),
+                        ),
+                    )
+                if path == "/api/admin/availability":
+                    return self.send(
+                        200,
+                        e.set_availability(
+                            body.get("doctor_id"),
+                            body.get("windows", []),
+                            body.get("weekday"),
+                            body.get("day"),
+                            body.get("remove", False),
+                            actor=user["username"],
+                        ),
+                    )
+                if path == "/api/admin/doctors":
+                    return self.send(200, e.save_doctor(body, user["username"]))
+                if path == "/api/admin/cancel":
+                    return self.send(
+                        200,
+                        e.cancel(
+                            body.get("reference"),
+                            appointment_id=body.get("appointment_id"),
+                            reason=body.get("reason", "Staff cancellation"),
+                            actor=user["username"],
+                            staff=True,
+                        ),
+                    )
+                if path == "/api/admin/move":
+                    return self.send(
+                        200,
+                        e.move(
+                            body.get("appointment_id"),
+                            body.get("start"),
+                            actor=user["username"],
+                            staff=True,
+                        ),
+                    )
+                if path == "/api/admin/users":
+                    return self.send(
+                        201,
+                        self.app.auth.create_user(
+                            body.get("username"),
+                            body.get("password"),
+                            body.get("role", "manager"),
+                            actor=user["username"],
+                        ),
+                    )
+            raise Problem("Endpoint not found", 404, "not_found")
+        except Problem as exc:
+            self.send(exc.status, {"error": str(exc), "code": exc.code})
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:
+            logging.exception("Request failed: %s", urlparse(self.path).path)
+            self.send(500, {"error": "Internal server error", "code": "internal_error"})
+
+
+class ClinicServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, address, app):
+        self.app = app
+        super().__init__(address, Handler)
+
+
+def make_engine(db=None, config=None):
+    with open(config or ROOT / "clinic.toml", "rb") as f:
+        cfg = tomllib.load(f)
+    return Engine(cfg, db or os.environ.get("CLINIC_DB", str(ROOT / "clinic.db")))
 
 
 def main():
-    import sys
-    port = int(sys.argv[1]) if len(sys.argv) > 1 else 8080
-    server = HTTPServer(("127.0.0.1", port), Handler)
-    print(f"Front Desk running at http://localhost:{port}/  (Ctrl-C to stop)")
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "8080")))
+    parser.add_argument("--host", default=os.environ.get("HOST", "127.0.0.1"))
+    parser.add_argument("--db")
+    parser.add_argument("--config")
+    args = parser.parse_args()
+    engine = make_engine(args.db, args.config)
+    app = App(engine, os.environ.get("APP_ORIGIN"), os.environ.get("TWILIO_AUTH_TOKEN"))
+    with engine.db() as db:
+        ready = db.execute(
+            'SELECT 1 FROM users WHERE role="admin" AND active=1'
+        ).fetchone()
+    if not ready:
+        print(
+            "Create staff access with: python manage.py create-user admin --role admin"
+        )
+    srv = ClinicServer((args.host, args.port), app)
+    stop = threading.Event()
+
+    def maintain():
+        while not stop.is_set():
+            try:
+                engine.maintenance()
+            except Exception:
+                logging.exception("Housekeeping failed")
+            stop.wait(60)
+
+    worker = threading.Thread(target=maintain, daemon=True)
+    worker.start()
+    print(f"Clinic scheduling available at http://{args.host}:{args.port}")
     try:
-        server.serve_forever()
+        srv.serve_forever()
     except KeyboardInterrupt:
-        print("\nbye.")
+        pass
+    finally:
+        stop.set()
+        worker.join(timeout=2)
+        srv.server_close()
 
 
 if __name__ == "__main__":
