@@ -16,6 +16,20 @@ Open the page: five tabs — **Today** (call log), **Bookings** (move/cancel),
 **Text Call** (the interactive demo), **Setup** (business config), **Admin**
 (control plane: engine health, holds, reminders, operator actions).
 
+## Frontend (Next.js)
+
+`frontend/` is a Next.js App Router UI wired to the same API — same five tabs,
+same server-issued booking ids:
+
+```bash
+cd frontend
+npm install
+npm run dev            # http://localhost:3000, proxies /api/* to :8080
+```
+
+Run `python3 server.py` (port 8080) first — the Next.js app proxies `/api/*`
+to it. `npm run build` verifies the production build.
+
 Every booking id the UI shows comes from the server. The Text Call tab runs
 the real flow — hold → commit → server-issued id — and its retry button
 replays the identical idempotency key to prove no duplicate is created.
@@ -40,7 +54,8 @@ The checks are not optional:
 | File | What it is |
 |---|---|
 | `server.py` | Stdlib HTTP server: JSON API + serves the UI |
-| `index.html` | The frontend: 5 tabs wired to the API, no mocks |
+| `index.html` | The vanilla frontend: 5 tabs wired to the API, no mocks |
+| `frontend/` | Next.js App Router UI: same 5 tabs, proxies `/api/*` to the Python server |
 | `engine.py` | Booking engine: SQLite, holds with TTL, idempotent commits, atomic moves |
 | `call_flow.py` | The scripted text-call flow (used by the CLI demos) |
 | `google_adapter.py` | The one real calendar: same 6 operations against Google Calendar |
